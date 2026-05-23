@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>AR měření vzdálenosti</title>
+  <style>
+    :root{--bg:#0b1220;--panel:rgba(15,23,42,.86);--text:#e5e7eb;--muted:#94a3b8;--accent:#34d399;--danger:#fb7185;--line:#60a5fa;}
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:radial-gradient(circle at top,#1e293b,#020617);color:var(--text);min-height:100vh;overflow:hidden}
+    #intro{position:fixed;inset:0;display:grid;place-items:center;padding:20px;z-index:10}
+    .card{width:min(560px,100%);background:var(--panel);border:1px solid rgba(148,163,184,.25);border-radius:24px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.35);backdrop-filter:blur(12px)}
+    h1{margin:0 0 10px;font-size:clamp(26px,5vw,42px);line-height:1.05}.lead{color:var(--muted);line-height:1.5;margin:0 0 18px}.hint{font-size:14px;color:var(--muted);line-height:1.45;margin-top:16px}.btn{border:0;border-radius:16px;padding:14px 18px;font-weight:750;font-size:16px;cursor:pointer;background:var(--accent);color:#042f2e;box-shadow:0 10px 25px rgba(52,211,153,.25)}.btn.secondary{background:rgba(148,163,184,.16);color:var(--text);box-shadow:none}.btn.danger{background:var(--danger);color:#450a0a}.row{display:flex;gap:10px;flex-wrap:wrap}
+    #overlay{position:fixed;inset:0;pointer-events:none;z-index:5;display:none}.topbar{position:absolute;top:env(safe-area-inset-top,0);left:0;right:0;padding:12px;display:flex;justify-content:center}.status{background:rgba(2,6,23,.72);border:1px solid rgba(148,163,184,.24);border-radius:999px;padding:9px 14px;font-weight:650;box-shadow:0 10px 28px rgba(0,0,0,.25);backdrop-filter:blur(8px)}.measure{position:absolute;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0));display:grid;gap:10px;pointer-events:auto}.result{background:rgba(2,6,23,.76);border:1px solid rgba(148,163,184,.25);border-radius:22px;padding:14px 16px;backdrop-filter:blur(8px);box-shadow:0 14px 35px rgba(0,0,0,.28)}.big{font-size:clamp(30px,9vw,56px);font-weight:850;letter-spacing:-.04em}.small{color:var(--muted);font-size:13px;margin-top:4px}.actions{display:flex;gap:10px}.actions .btn{flex:1}.crosshair{position:absolute;left:50%;top:50%;width:34px;height:34px;translate:-50% -50%;border:2px solid rgba(255,255,255,.9);border-radius:50%;box-shadow:0 0 0 6px rgba(0,0,0,.16)}.crosshair::before,.crosshair::after{content:"";position:absolute;background:rgba(255,255,255,.9);left:50%;top:50%;translate:-50% -50%}.crosshair::before{width:18px;height:2px}.crosshair::after{width:2px;height:18px}.warn{color:#fecaca}.ok{color:#bbf7d0} canvas{display:block}
+  </style>
+</head>
+<body>
+  <section id="intro">
+    <div class="card">
+      <h1>AR měření vzdálenosti</h1>
+      <p class="lead">Android + Chrome. Namíř telefon na podlahu/stůl/stěnu, počkej až se bod přichytí, klepni na bod A, pak na bod B.</p>
+      <div class="row">
+        <button id="startBtn" class="btn">Spustit AR měření</button>
+        <button id="checkBtn" class="btn secondary">Ověřit podporu</button>
+      </div>
+      <div id="support" class="hint">Aplikace musí běžet přes HTTPS, například z GitHub Pages. Z lokálního souboru AR většinou nepoběží.</div>
+    </div>
+  </section>
+
+  <div id="overlay">
+    <div class="crosshair"></div>
+    <div class="topbar"><div id="status" class="status">Hledám povrch…</div></div>
+    <div class="measure">
+      <div class="result">
+        <div id="distance" class="big">—</div>
+        <div id="detail" class="small">Klepnutím označ první bod.</div>
+      </div>
+      <div class="actions">
+        <button id="placeBtn" class="btn">Označit bod A</button>
+        <button id="resetBtn" class="btn secondary">Reset</button>
+        <button id="exitBtn" class="btn danger">Konec</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.164.1/build/three.module.js';
+
+    const intro = document.getElementById('intro');
+    const overlay = document.getElementById('overlay');
+    const startBtn = document.getElementById('startBtn');
+    const checkBtn = document.getElementById('checkBtn');
+    const support = document.getElementById('support');
+    const statusEl = document.getElementById('status');
+    const distanceEl = document.getElementById('distance');
+    const detailEl = document.getElementById('detail');
+    const placeBtn = document.getElementById('placeBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const exitBtn = document.getElementById('exitBtn');
+
+    let camera, scene, renderer, controller;
+    let reticle, hitTestSource = null, hitTestSourceRequested = false;
+    let currentHit = null, pointA = null, pointB = null;
+    let markers = [], line = null, session = null;
+
+    async function checkSupport() {
+      if (!('xr' in navigator)) {
+        support.innerHTML = '<span class="warn">Tento prohlížeč nemá WebXR.</span> Zkus Chrome na Androidu s podporou ARCore.';
+        return false;
+      }
+      const ok = await navigator.xr.isSessionSupported('immersive-ar');
+      support.innerHTML = ok
+        ? '<span class="ok">AR režim je dostupný.</span> Spusť měření a povol kameru.'
+        : '<span class="warn">AR režim tady není dostupný.</span> Zkus Chrome na Androidu a ověř, že telefon podporuje Google Play Services for AR.';
+      return ok;
+    }
+
+    function initThree() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 30);
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 3);
+      scene.add(light);
+
+      reticle = new THREE.Mesh(
+        new THREE.RingGeometry(0.045, 0.055, 32).rotateX(-Math.PI / 2),
+        new THREE.MeshBasicMaterial({ color: 0x34d399 })
+      );
+      reticle.matrixAutoUpdate = false;
+      reticle.visible = false;
+      scene.add(reticle);
+
+      controller = renderer.xr.getController(0);
+      controller.addEventListener('select', placePoint);
+      scene.add(controller);
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    }
+
+    async function startAR() {
+      const supported = await checkSupport();
+      if (!supported) return;
+      if (!scene) initThree();
+      try {
+        session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local-floor'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: overlay }
+        });
+        session.addEventListener('end', onSessionEnd);
+        renderer.xr.setReferenceSpaceType('local-floor');
+        await renderer.xr.setSession(session);
+        intro.style.display = 'none';
+        overlay.style.display = 'block';
+        resetMeasurement();
+        renderer.setAnimationLoop(render);
+      } catch (err) {
+        support.innerHTML = '<span class="warn">AR se nepodařilo spustit:</span> ' + err.message;
+      }
+    }
+
+    function makeMarker(pos, color = 0x34d399) {
+      const geo = new THREE.SphereGeometry(0.025, 24, 16);
+      const mat = new THREE.MeshBasicMaterial({ color });
+      const m = new THREE.Mesh(geo, mat);
+      m.position.copy(pos);
+      scene.add(m);
+      markers.push(m);
+      return m;
+    }
+
+    function updateLine() {
+      if (line) { scene.remove(line); line.geometry.dispose(); line.material.dispose(); line = null; }
+      if (!pointA || !pointB) return;
+      const geo = new THREE.BufferGeometry().setFromPoints([pointA, pointB]);
+      const mat = new THREE.LineBasicMaterial({ color: 0x60a5fa, linewidth: 4 });
+      line = new THREE.Line(geo, mat);
+      scene.add(line);
+    }
+
+    function formatDistance(m) {
+      if (m < 1) return Math.round(m * 1000) / 10 + ' cm';
+      return (Math.round(m * 1000) / 1000).toLocaleString('cs-CZ') + ' m';
+    }
+
+    function placePoint() {
+      if (!currentHit) {
+        statusEl.textContent = 'Bod zatím není přichycený k povrchu.';
+        return;
+      }
+      if (!pointA || (pointA && pointB)) {
+        clearObjects();
+        pointA = currentHit.clone();
+        pointB = null;
+        makeMarker(pointA, 0x34d399);
+        distanceEl.textContent = '—';
+        detailEl.textContent = 'Bod A uložen. Teď označ bod B.';
+        placeBtn.textContent = 'Označit bod B';
+        statusEl.textContent = 'Bod A uložen';
+      } else {
+        pointB = currentHit.clone();
+        makeMarker(pointB, 0xfb7185);
+        updateLine();
+        const d = pointA.distanceTo(pointB);
+        distanceEl.textContent = formatDistance(d);
+        detailEl.textContent = 'Hotovo. Dalším klepnutím začneš nové měření.';
+        placeBtn.textContent = 'Nové měření';
+        statusEl.textContent = 'Vzdálenost změřena';
+      }
+    }
+
+    function clearObjects() {
+      markers.forEach(m => { scene.remove(m); m.geometry.dispose(); m.material.dispose(); });
+      markers = [];
+      if (line) { scene.remove(line); line.geometry.dispose(); line.material.dispose(); line = null; }
+    }
+
+    function resetMeasurement() {
+      clearObjects();
+      pointA = null; pointB = null; currentHit = null;
+      distanceEl.textContent = '—';
+      detailEl.textContent = 'Klepnutím označ první bod.';
+      placeBtn.textContent = 'Označit bod A';
+      statusEl.textContent = 'Hledám povrch…';
+    }
+
+    function onSessionEnd() {
+      renderer.setAnimationLoop(null);
+      overlay.style.display = 'none';
+      intro.style.display = 'grid';
+      hitTestSourceRequested = false;
+      hitTestSource = null;
+      session = null;
+      resetMeasurement();
+    }
+
+    function render(timestamp, frame) {
+      if (frame) {
+        const xrSession = renderer.xr.getSession();
+        const refSpace = renderer.xr.getReferenceSpace();
+        if (!hitTestSourceRequested) {
+          xrSession.requestReferenceSpace('viewer').then(viewerSpace => {
+            xrSession.requestHitTestSource({ space: viewerSpace }).then(source => { hitTestSource = source; });
+          });
+          xrSession.addEventListener('end', () => { hitTestSourceRequested = false; hitTestSource = null; });
+          hitTestSourceRequested = true;
+        }
+        if (hitTestSource) {
+          const hits = frame.getHitTestResults(hitTestSource);
+          if (hits.length) {
+            const pose = hits[0].getPose(refSpace);
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
+            currentHit = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+            if (!pointA || !pointB) statusEl.textContent = 'Bod přichycený k povrchu';
+          } else {
+            reticle.visible = false;
+            currentHit = null;
+            if (!pointA || !pointB) statusEl.textContent = 'Hledám povrch…';
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    startBtn.addEventListener('click', startAR);
+    checkBtn.addEventListener('click', checkSupport);
+    placeBtn.addEventListener('click', placePoint);
+    resetBtn.addEventListener('click', resetMeasurement);
+    exitBtn.addEventListener('click', () => session && session.end());
+
+    checkSupport();
+  </script>
+</body>
+</html>
